@@ -31,6 +31,7 @@ class TrainConfig:
     max_target_length: int
     per_device_train_batch_size: int
     per_device_val_batch_size: int
+    ddp_find_unused_parameters: bool
     min_gradient_accumulation_steps: int
     max_gradient_accumulation_steps: int
     grad_accum_growth_factor: int
@@ -56,13 +57,25 @@ class TrainConfig:
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Treino de sumarizacao multi-GPU com retomada para vast.ai")
-    parser.add_argument("--model-name", type=str, default="/workspace/t5gemma-2-270m-270m")
+    parser.add_argument("--model-name", type=str, default="google/t5gemma-2-270m-270m")
     parser.add_argument("--data-glob", type=str, default="datasets/*/*/*.json")
     parser.add_argument("--output-dir", type=str, default="checkpoints/t5gemma2-270m-sumarios-ddp")
     parser.add_argument("--max-source-length", type=int, default=3072)
     parser.add_argument("--max-target-length", type=int, default=736)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--per-device-val-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        action="store_true",
+        default=True,
+        help="Ativa find_unused_parameters no DDP para evitar erro de reducao em modelos com parametros condicionalmente nao usados.",
+    )
+    parser.add_argument(
+        "--no-ddp-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_false",
+        help="Desativa find_unused_parameters no DDP para reduzir overhead quando voce tem certeza de que todos os parametros sao sempre usados.",
+    )
     parser.add_argument("--min-gradient-accumulation-steps", type=int, default=2)
     parser.add_argument("--max-gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--grad-accum-growth-factor", type=int, default=2)
@@ -118,6 +131,7 @@ def parse_args() -> TrainConfig:
         max_target_length=args.max_target_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_val_batch_size=args.per_device_val_batch_size,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         min_gradient_accumulation_steps=args.min_gradient_accumulation_steps,
         max_gradient_accumulation_steps=args.max_gradient_accumulation_steps,
         grad_accum_growth_factor=args.grad_accum_growth_factor,
@@ -653,7 +667,11 @@ def main() -> None:
     model.to(device)
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            find_unused_parameters=cfg.ddp_find_unused_parameters,
+        )
 
     train_dataset = SummarizationDataset(train_records, tokenizer, cfg.max_source_length, cfg.max_target_length)
     val_dataset = SummarizationDataset(val_records, tokenizer, cfg.max_source_length, cfg.max_target_length)
