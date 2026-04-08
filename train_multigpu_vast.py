@@ -56,7 +56,7 @@ class TrainConfig:
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Treino de sumarizacao multi-GPU com retomada para vast.ai")
-    parser.add_argument("--model-name", type=str, default="google/t5gemma-2-270m-270m")
+    parser.add_argument("--model-name", type=str, default="/workspace/t5gemma-2-270m-270m")
     parser.add_argument("--data-glob", type=str, default="datasets/*/*/*.json")
     parser.add_argument("--output-dir", type=str, default="checkpoints/t5gemma2-270m-sumarios-ddp")
     parser.add_argument("--max-source-length", type=int, default=3072)
