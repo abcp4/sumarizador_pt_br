@@ -379,13 +379,16 @@ def save_checkpoint(
     global_update_step: int,
     rank: int,
     tag: str,
+    save_tagged_checkpoint: bool = True,
 ) -> str:
     if not is_main_process(rank):
         return ""
 
-    ckpt_dir = os.path.join(cfg.output_dir, "checkpoints")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(ckpt_dir, f"{tag}.pt")
+    ckpt_path = ""
+    if save_tagged_checkpoint:
+        ckpt_dir = os.path.join(cfg.output_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(ckpt_dir, f"{tag}.pt")
 
     state = {
         "config": asdict(cfg),
@@ -402,11 +405,12 @@ def save_checkpoint(
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "saved_at": time.time(),
     }
-    safe_torch_save(state, ckpt_path)
+    if save_tagged_checkpoint:
+        safe_torch_save(state, ckpt_path)
 
     latest_path = os.path.join(cfg.output_dir, "latest.pt")
     safe_torch_save(state, latest_path)
-    return ckpt_path
+    return ckpt_path if save_tagged_checkpoint else latest_path
 
 
 def maybe_resume_path(cfg: TrainConfig) -> Optional[str]:
@@ -913,9 +917,10 @@ def main() -> None:
                         global_update_step,
                         rank,
                         tag=f"update_{global_update_step}",
+                        save_tagged_checkpoint=False,
                     )
                     if is_main_process(rank):
-                        print(f"Checkpoint salvo: {ckpt_path}")
+                        print(f"Checkpoint latest atualizado: {ckpt_path}")
 
                 if cfg.preview_every_updates > 0 and global_update_step % cfg.preview_every_updates == 0:
                     append_preview_log(
@@ -935,22 +940,7 @@ def main() -> None:
                         )
 
                 if (not stable_ckpt_saved) and global_update_step >= warmup_steps:
-                    ckpt_path = save_checkpoint(
-                        cfg,
-                        model,
-                        optimizer,
-                        scheduler,
-                        scaler,
-                        epoch,
-                        step + 1,
-                        global_micro_step,
-                        global_update_step,
-                        rank,
-                        tag=f"stable_start_update_{global_update_step}",
-                    )
                     stable_ckpt_saved = True
-                    if is_main_process(rank):
-                        print(f"Checkpoint inicio fase estavel salvo: {ckpt_path}")
 
                 if (not decay_ckpt_saved) and global_update_step >= decay_start_update:
                     ckpt_path = save_checkpoint(
@@ -1015,6 +1005,22 @@ def main() -> None:
         )
         if is_main_process(rank):
             print(f"Checkpoint de fim de epoca salvo: {ckpt_path}")
+
+    final_decay_ckpt = save_checkpoint(
+        cfg,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        cfg.num_epochs,
+        0,
+        global_micro_step,
+        global_update_step,
+        rank,
+        tag="final_decay_end",
+    )
+    if is_main_process(rank):
+        print(f"Checkpoint fim do decay salvo: {final_decay_ckpt}")
 
     barrier(distributed)
 
