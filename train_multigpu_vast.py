@@ -418,6 +418,39 @@ def maybe_resume_path(cfg: TrainConfig) -> Optional[str]:
     return cfg.resume if os.path.exists(cfg.resume) else None
 
 
+def _normalize_rng_state(state) -> Optional[torch.Tensor]:
+    if state is None:
+        return None
+    if isinstance(state, torch.Tensor):
+        tensor = state.detach().to(device="cpu")
+        if tensor.dtype != torch.uint8:
+            tensor = tensor.to(torch.uint8)
+        return tensor.contiguous()
+    if isinstance(state, (bytes, bytearray)):
+        return torch.tensor(list(state), dtype=torch.uint8)
+    if isinstance(state, list):
+        return torch.tensor(state, dtype=torch.uint8)
+    return None
+
+
+def _normalize_cuda_rng_state_all(states) -> Optional[List[torch.Tensor]]:
+    if states is None or not isinstance(states, (list, tuple)):
+        return None
+    normalized: List[torch.Tensor] = []
+    for state in states:
+        tensor = _normalize_rng_state(state)
+        if tensor is not None:
+            normalized.append(tensor)
+    return normalized if normalized else None
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device=device, non_blocking=True)
+
+
 def load_checkpoint(
     checkpoint_path: str,
     model: torch.nn.Module,
@@ -427,9 +460,10 @@ def load_checkpoint(
     device: torch.device,
     load_scheduler_state: bool,
 ) -> Tuple[int, int, int, int]:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     load_model_state_dict(model, checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    _move_optimizer_state_to_device(optimizer, device)
 
     if load_scheduler_state and scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -440,9 +474,13 @@ def load_checkpoint(
     if checkpoint.get("python_random_state") is not None:
         random.setstate(checkpoint["python_random_state"])
     if checkpoint.get("torch_rng_state") is not None:
-        torch.set_rng_state(checkpoint["torch_rng_state"])
+        torch_rng_state = _normalize_rng_state(checkpoint["torch_rng_state"])
+        if torch_rng_state is not None:
+            torch.set_rng_state(torch_rng_state)
     if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
-        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+        cuda_rng_states = _normalize_cuda_rng_state_all(checkpoint["cuda_rng_state_all"])
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
 
     epoch = int(checkpoint.get("epoch", 0))
     step_in_epoch = int(checkpoint.get("step_in_epoch", 0))
