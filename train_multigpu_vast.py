@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+from datasets import load_dataset
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
@@ -52,6 +53,8 @@ class TrainConfig:
     val_ratio: float
     seed: int
     num_workers: int
+    use_recogna_dataset: bool
+    recogna_split: str
     resume: str
 
 
@@ -116,6 +119,24 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
+        "--use-recogna-dataset",
+        action="store_true",
+        default=True,
+        help="Inclui o dataset recogna-nlp/recognasumm no treino.",
+    )
+    parser.add_argument(
+        "--no-use-recogna-dataset",
+        dest="use_recogna_dataset",
+        action="store_false",
+        help="Desativa o uso do dataset recogna-nlp/recognasumm.",
+    )
+    parser.add_argument(
+        "--recogna-split",
+        type=str,
+        default="train",
+        help="Split do dataset recogna-nlp/recognasumm a ser carregado.",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default="auto",
@@ -152,6 +173,8 @@ def parse_args() -> TrainConfig:
         val_ratio=args.val_ratio,
         seed=args.seed,
         num_workers=args.num_workers,
+        use_recogna_dataset=args.use_recogna_dataset,
+        recogna_split=args.recogna_split,
         resume=args.resume,
     )
 
@@ -222,13 +245,15 @@ def infer_summary_type_from_path(path: str) -> str:
 
     type_folder = parts[datasets_idx + 1]
     type_map = {
-        "curtos": "curtos",
+        "frases": "frases",
         "hierarquico": "hierarquico",
         "topicos": "topicos",
         "sem_restricao": "sem_restricao",
         "hierarquicos": "hierarquico",
         "topico": "topicos",
-        "curto": "curtos",
+        "curtos": "frases",
+        "curto": "frases",
+        "frase": "frases",
         "sem-restricao": "sem_restricao",
     }
 
@@ -239,16 +264,17 @@ def infer_summary_type_from_path(path: str) -> str:
 
 
 def get_target_field(summary_type: str) -> str:
-    if summary_type in {"curtos", "hierarquico", "topicos"}:
+    if summary_type in {"frases", "hierarquico", "topicos"}:
         return "short_summary"
     return "summary"
 
 
 PROMPT_BY_TYPE = {
-    "curtos": "Resuma em portugues em poucas frases, com foco nas ideias centrais.",
+    "frases": "Resuma em portugues em poucas frases, com foco nas ideias centrais.",
     "hierarquico": "Resuma em portugues em estrutura hierarquica, do geral para o especifico.",
     "topicos": "Resuma em portugues em topicos objetivos e informativos.",
-    "sem_restricao": "Resuma em portugues de forma clara, fiel e coesa.",
+    "sem_restricao": "Resuma em portugues.",
+    "abstrativo": "Resuma em portugues com escrita abstrativa.",
 }
 
 
@@ -262,7 +288,15 @@ def build_prefixed_input(page_content: str, summary_type: str) -> str:
     )
 
 
-def load_records(data_glob: str, val_ratio: float, seed: int) -> Tuple[List[Dict], List[Dict]]:
+def load_records(
+    data_glob: str,
+    val_ratio: float,
+    seed: int,
+    use_recogna_dataset: bool,
+    recogna_split: str,
+    rank: int,
+    distributed: bool,
+) -> Tuple[List[Dict], List[Dict]]:
     paths = glob.glob(data_glob)
     if not paths:
         raise ValueError(f"Nenhum arquivo encontrado para o padrao: {data_glob}")
@@ -291,6 +325,34 @@ def load_records(data_glob: str, val_ratio: float, seed: int) -> Tuple[List[Dict
                 "source_raw": source_raw,
             }
         )
+
+    if use_recogna_dataset:
+        # Evita downloads simultaneos em DDP: rank 0 preenche cache primeiro.
+        if distributed and dist.is_initialized() and rank != 0:
+            dist.barrier()
+
+        recogna_dataset = load_dataset("recogna-nlp/recognasumm", split=recogna_split)
+        for item in tqdm(recogna_dataset, desc="Carregando recogna-nlp/recognasumm", leave=False):
+            source_raw = str(item.get("Noticia") or "").strip()
+            target = str(item.get("Sumario") or "").strip()
+            if not source_raw or not target:
+                continue
+
+            summary_type = "abstrativo"
+            source = build_prefixed_input(source_raw, summary_type)
+            records.append(
+                {
+                    "path": "recogna-nlp/recognasumm",
+                    "summary_type": summary_type,
+                    "target_field": "Sumario",
+                    "source": source,
+                    "target": target,
+                    "source_raw": source_raw,
+                }
+            )
+
+        if distributed and dist.is_initialized() and rank == 0:
+            dist.barrier()
 
     if len(records) < 10:
         raise ValueError(f"Poucos exemplos apos filtragem: {len(records)}")
@@ -617,7 +679,7 @@ def build_wsd_lambda(warmup_updates: int, stable_updates: int, decay_updates: in
 
 
 def select_preview_examples(val_examples: List[Dict]) -> List[Dict]:
-    ordered_types = ["curtos", "hierarquico", "topicos", "sem_restricao"]
+    ordered_types = ["frases", "hierarquico", "topicos", "sem_restricao", "abstrativo"]
     selected_examples: List[Dict] = []
     for summary_type in ordered_types:
         ex = next((item for item in val_examples if item.get("summary_type") == summary_type), None)
@@ -697,7 +759,15 @@ def main() -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
     ckpt_to_resume = maybe_resume_path(cfg)
 
-    train_records, val_records = load_records(cfg.data_glob, cfg.val_ratio, cfg.seed)
+    train_records, val_records = load_records(
+        data_glob=cfg.data_glob,
+        val_ratio=cfg.val_ratio,
+        seed=cfg.seed,
+        use_recogna_dataset=cfg.use_recogna_dataset,
+        recogna_split=cfg.recogna_split,
+        rank=rank,
+        distributed=distributed,
+    )
     rank_print(rank, f"Treino: {len(train_records)} | Validacao: {len(val_records)}")
     preview_examples = select_preview_examples(val_records)
     if is_main_process(rank):
